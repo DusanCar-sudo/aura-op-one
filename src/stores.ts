@@ -20,10 +20,11 @@ import type {
   Preferences,
   OpOneEpisode,
   Provenance,
+  ProviderProfile,
 } from './types.js';
 import { DEFAULT_PREFERENCES } from './types.js';
 import { validateAgent, AgentSchemaError } from './agent-schema.js';
-import { redactSecrets, redactValue } from './redact.js';
+import { redactSecrets, redactValue, registerSecret } from './redact.js';
 
 /** Root of everything Aura OP One owns. Overridable for tests. */
 export function opOneRoot(): string {
@@ -37,11 +38,14 @@ function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-/** Atomic JSON write. */
-function writeJson(filePath: string, data: unknown): void {
+/** Atomic JSON write. `mode` restricts the file, for stores that hold credentials. */
+function writeJson(filePath: string, data: unknown, mode?: number): void {
   ensureDir(path.dirname(filePath));
   const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode });
+  // writeFileSync only applies `mode` when it creates the file; a stale .tmp
+  // left by a crash would keep its old permissions, so set it explicitly.
+  if (mode !== undefined) fs.chmodSync(tmp, mode);
   fs.renameSync(tmp, filePath);
 }
 
@@ -224,6 +228,143 @@ export const preferencesStore = {
 
   update(patch: Partial<Preferences>): Preferences {
     return this.save({ ...this.load(), ...patch });
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider profiles (the one store that holds a credential)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ProviderFile {
+  /** Name of the profile the agent uses. Absent until one is chosen. */
+  active?: string;
+  profiles: ProviderProfile[];
+  /** True once the first-run welcome was declined, so it does not nag. */
+  welcomeSkipped?: boolean;
+}
+
+/** Keeps only well-formed profiles, so a hand-edited file cannot crash startup. */
+function sanitiseProfile(raw: unknown): ProviderProfile | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const p = raw as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const name = str(p.name);
+  const baseUrl = str(p.baseUrl);
+  const model = str(p.model);
+  if (!name || !baseUrl || !model) return undefined;
+  return {
+    name,
+    baseUrl,
+    apiKey: typeof p.apiKey === 'string' ? p.apiKey.trim() : '',
+    model,
+    createdAt: str(p.createdAt) || new Date(0).toISOString(),
+  };
+}
+
+/**
+ * Saved provider endpoints and which one is active.
+ *
+ * Kept apart from `preferencesStore` on purpose: preferences are things the
+ * client may show and export, this file holds API keys. It is written mode 0600
+ * and every key that passes through is registered with the redactor, so a key
+ * cannot reach a conversation, an episode, or the screen by accident.
+ *
+ * Nothing here is cached — the engine calls `active()` on every turn, which is
+ * what makes `:provider` and `:model` take effect without a restart.
+ */
+export const providerStore = {
+  filePath(): string {
+    return path.join(opOneRoot(), 'providers.json');
+  },
+
+  load(): ProviderFile {
+    const raw = readJson<Partial<ProviderFile>>(this.filePath(), {});
+    const profiles = (Array.isArray(raw.profiles) ? raw.profiles : [])
+      .map(sanitiseProfile)
+      .filter((p): p is ProviderProfile => p !== undefined);
+    for (const p of profiles) registerSecret(p.apiKey);
+    return {
+      active: typeof raw.active === 'string' ? raw.active : undefined,
+      profiles,
+      welcomeSkipped: raw.welcomeSkipped === true,
+    };
+  },
+
+  write(file: ProviderFile): void {
+    for (const p of file.profiles) registerSecret(p.apiKey);
+    writeJson(this.filePath(), file, 0o600);
+  },
+
+  list(): ProviderProfile[] {
+    return this.load().profiles;
+  },
+
+  /** The profile the agent is using, or undefined before first-run setup. */
+  active(): ProviderProfile | undefined {
+    const f = this.load();
+    return f.profiles.find(p => p.name === f.active);
+  },
+
+  get(name: string): ProviderProfile | undefined {
+    return this.list().find(p => p.name === name);
+  },
+
+  /** Profile for the same endpoint, so re-running setup updates rather than duplicates. */
+  findByUrl(baseUrl: string): ProviderProfile | undefined {
+    return this.list().find(p => p.baseUrl === baseUrl);
+  },
+
+  /** Adds or replaces a profile by name. Activates it unless told otherwise. */
+  upsert(profile: ProviderProfile, opts: { activate?: boolean } = {}): ProviderProfile {
+    const f = this.load();
+    const saved = sanitiseProfile(profile);
+    if (!saved) throw new Error('provider profile needs a name, a base URL and a model');
+    const i = f.profiles.findIndex(p => p.name === saved.name);
+    if (i >= 0) f.profiles[i] = saved;
+    else f.profiles.push(saved);
+    if (opts.activate ?? true) f.active = saved.name;
+    this.write(f);
+    return saved;
+  },
+
+  setActive(name: string): ProviderProfile | undefined {
+    const f = this.load();
+    const found = f.profiles.find(p => p.name === name);
+    if (!found) return undefined;
+    f.active = name;
+    this.write(f);
+    return found;
+  },
+
+  /** Changes the model of one profile — the "switch model" half of `:model`. */
+  setModel(name: string, model: string): ProviderProfile | undefined {
+    const f = this.load();
+    const found = f.profiles.find(p => p.name === name);
+    if (!found || !model.trim()) return undefined;
+    found.model = model.trim();
+    this.write(f);
+    return found;
+  },
+
+  /** Deletes a profile and its key. If it was active, the first remaining one takes over. */
+  remove(name: string): boolean {
+    const f = this.load();
+    const i = f.profiles.findIndex(p => p.name === name);
+    if (i < 0) return false;
+    f.profiles.splice(i, 1);
+    if (f.active === name) f.active = f.profiles[0]?.name;
+    this.write(f);
+    return true;
+  },
+
+  welcomeSkipped(): boolean {
+    return this.load().welcomeSkipped === true;
+  },
+
+  skipWelcome(): void {
+    const f = this.load();
+    f.welcomeSkipped = true;
+    this.write(f);
   },
 };
 

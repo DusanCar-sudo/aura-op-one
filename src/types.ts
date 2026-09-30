@@ -238,6 +238,32 @@ export const DEFAULT_PREFERENCES: Preferences = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Provider profiles
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One saved endpoint: everything the agent needs to talk to a model provider is
+ * a base URL, an API key and a model name — and the model name is chosen from
+ * the list the endpoint itself reports, not typed from memory.
+ *
+ * Every provider OP One supports speaks the OpenAI-compatible wire format at its
+ * base URL (OpenAI, Anthropic's `/v1` compat layer, Google's `/openai`,
+ * OpenRouter, Groq, DeepSeek, Ollama, LM Studio, llama.cpp, vLLM, ...), so a
+ * profile carries no "provider type" and needs none.
+ */
+export interface ProviderProfile {
+  /** Short unique handle shown by `:provider` and used by `:provider <name>`. */
+  name: string;
+  /** Normalised: no trailing slash, no query or fragment, no credentials. */
+  baseUrl: string;
+  /** Empty for keyless endpoints (Ollama, LM Studio). Never displayed or logged. */
+  apiKey: string;
+  /** The model chosen from the endpoint's own list. */
+  model: string;
+  createdAt: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Episodes (OP One provenance envelope)
 // ─────────────────────────────────────────────────────────────────────────────
 

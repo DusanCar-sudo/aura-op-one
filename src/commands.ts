@@ -11,13 +11,16 @@
 // the current turn.
 
 import type { OpOneSession } from './session.js';
-import type { AgentDefinition } from './types.js';
-import { agentStore, preferencesStore, opOneEpisodeStore } from './stores.js';
+import type { AgentDefinition, ProviderProfile } from './types.js';
+import { agentStore, preferencesStore, opOneEpisodeStore, providerStore } from './stores.js';
 import { validateAgent, AgentSchemaError, KNOWN_TOOLS } from './agent-schema.js';
 import { retrieve } from './memory.js';
 import { runCouncil, CouncilError } from './council.js';
 import { HELP_TEXT } from './display.js';
 import { stateLabel } from './verification.js';
+import { discoverModels } from './providers.js';
+import { runSetup, pickModel, matchModelChoice, renderModelList } from './setup.js';
+import type { SetupIO } from './setup.js';
 
 export interface CommandResult {
   /** Text to show. */
@@ -33,17 +36,27 @@ export function isCommand(input: string): boolean {
   return input.trimStart().startsWith(':');
 }
 
+/** The rest of what the few dialogue commands need from a terminal. */
+export interface CommandIO {
+  /** Like `prompt`, but not echoed — for API keys. */
+  askSecret: (question: string) => Promise<string>;
+  /** Writes progress text while a command is still running. */
+  write: (text: string) => void;
+}
+
 /**
  * Executes one command.
  *
- * `prompt` is supplied by the CLI for the few commands that need to ask a
- * follow-up (creating an agent). It is absent in tests, where those commands
- * report what they would have asked for instead of blocking.
+ * `prompt` and `io` are supplied by the CLI for the few commands that hold a
+ * dialogue (creating an agent, connecting a provider, picking a model). They are
+ * absent in tests, where those commands report what they would have asked for
+ * instead of blocking.
  */
 export async function runCommand(
   session: OpOneSession,
   input: string,
   prompt?: (question: string) => Promise<string>,
+  io?: CommandIO,
 ): Promise<CommandResult> {
   const trimmed = input.trim();
   if (!isCommand(trimmed)) return { output: '', passthrough: true };
@@ -56,7 +69,9 @@ export async function runCommand(
     case 'help': return { output: HELP_TEXT };
     case 'quit': case 'exit': return { output: 'bye.', quit: true };
     case 'agent': return cmdAgent(session, arg, prompt);
-    case 'model': return cmdModel(session, arg);
+    case 'model': return cmdModel(session, arg, prompt, io);
+    case 'provider': case 'providers': return cmdProvider(session, arg, prompt, io);
+    case 'setup': return cmdSetup(session, prompt, io);
     case 'council': return cmdCouncil(session, arg);
     case 'mesh': return cmdMesh(session, arg);
     case 'verify': return cmdVerify(session);
@@ -148,7 +163,122 @@ async function cmdAgentNew(prompt?: (q: string) => Promise<string>): Promise<Com
 
 // ── :model ────────────────────────────────────────────────────────────────────
 
-async function cmdModel(session: OpOneSession, arg: string): Promise<CommandResult> {
+/** The scripted dialogue surface, when the CLI gave us one. */
+function dialogue(
+  prompt?: (question: string) => Promise<string>,
+  io?: CommandIO,
+): SetupIO | undefined {
+  return prompt && io ? { ask: prompt, askSecret: io.askSecret, write: io.write } : undefined;
+}
+
+/**
+ * A session `:model` override outranks everything, including the provider's
+ * model, so a provider or model change has to drop a stale one or it would
+ * silently do nothing.
+ */
+function dropStaleOverride(session: OpOneSession): void {
+  if (session.activeModelOverride()) session.setModelOverride(undefined);
+}
+
+async function cmdModel(
+  session: OpOneSession,
+  arg: string,
+  prompt?: (q: string) => Promise<string>,
+  io?: CommandIO,
+): Promise<CommandResult> {
+  const profile = session.activeProvider();
+  if (!profile) return cmdModelWithoutProvider(session, arg);
+
+  if (arg === 'auto' || arg === 'clear' || arg === 'none') {
+    dropStaleOverride(session);
+    return { output: `override cleared — using ${profile.model} from ${profile.name}` };
+  }
+
+  const found = await discoverModels(profile.baseUrl, profile.apiKey);
+
+  // ── :model <number | name> ──
+  if (arg) {
+    if (!found.ok) {
+      // The provider's list is unreachable; a typed name can still be honoured,
+      // a number cannot mean anything without the list it indexes.
+      if (/^\d+$/.test(arg)) {
+        return { output: `cannot resolve "${arg}" without the model list — ${found.message}\n  :model =<name>  sets one by hand` };
+      }
+      const literal = arg.startsWith('=') ? arg.slice(1).trim() : arg;
+      return setProfileModel(session, profile, literal, `could not check ${profile.name}'s list: ${found.message}`);
+    }
+    const choice = matchModelChoice(found.models, found.models, arg);
+    if (choice.kind === 'one') return setProfileModel(session, profile, choice.model);
+    if (choice.kind === 'many') {
+      return {
+        output:
+          `"${arg}" matches ${choice.matches.length} models — be more specific, or use a number:\n` +
+          `${renderModelList(choice.matches, profile.model)}`,
+      };
+    }
+    return {
+      output: `${choice.reason} — :model lists what ${profile.name} offers  (:model =<name> forces an unlisted one)`,
+    };
+  }
+
+  // ── :model ──
+  const info = describeModel(session, profile);
+  if (!found.ok) {
+    return { output: `${info}\n\n✗ ${found.message}\n\n  :model <name>  sets one by hand` };
+  }
+
+  const sio = dialogue(prompt, io);
+  if (sio) {
+    sio.write(`${info}\n\n`);
+    const picked = await pickModel(sio, found.models, profile.model);
+    if (!picked || picked === profile.model) return { output: `model unchanged: ${profile.model}` };
+    return setProfileModel(session, profile, picked);
+  }
+  return {
+    output: `${info}\n\n${renderModelList(found.models, profile.model)}\n\n  :model <number|name>  switch to it`,
+  };
+}
+
+/** Provider, model, and what would override it — the "where am I" for `:model`. */
+function describeModel(session: OpOneSession, profile: ProviderProfile): string {
+  const override = session.activeModelOverride();
+  const policy = session.activeAgent().modelPolicy;
+  const policyText = policy.kind === 'pinned' ? `pinned:${policy.model}` : policy.kind;
+  const last = session.lastResult();
+  const lines = [
+    `provider:     ${profile.name} (${profile.baseUrl})`,
+    `model:        ${profile.model}`,
+  ];
+  if (override) {
+    lines.push(`override:     ${override}  (wins over the provider's model — :model auto clears it)`);
+  }
+  lines.push(`agent policy: ${policyText}`);
+  if (last) lines.push(`last run used: ${last.model}${last.usedLocalModel ? ' (local)' : ''}`);
+  return lines.join('\n');
+}
+
+function setProfileModel(
+  session: OpOneSession,
+  profile: ProviderProfile,
+  model: string,
+  note?: string,
+): CommandResult {
+  providerStore.setModel(profile.name, model);
+  dropStaleOverride(session);
+
+  const lines = [`model: ${model}  (${profile.name})`];
+  if (note) lines.push(`  note: ${note}`);
+  const policy = session.activeAgent().modelPolicy;
+  if (policy.kind === 'pinned') {
+    lines.push(`  note: agent "${session.activeAgent().name}" is pinned to ${policy.model}, which takes precedence — :agent to switch`);
+  } else if (policy.kind === 'local-only') {
+    lines.push(`  note: agent "${session.activeAgent().name}" is local-only, so it will not use ${profile.name}`);
+  }
+  return { output: lines.join('\n') };
+}
+
+/** `:model` before any provider is set up: the free-text session override. */
+function cmdModelWithoutProvider(session: OpOneSession, arg: string): CommandResult {
   if (!arg) {
     const override = session.activeModelOverride();
     const policy = session.activeAgent().modelPolicy;
@@ -162,7 +292,8 @@ async function cmdModel(session: OpOneSession, arg: string): Promise<CommandResu
         `model override: ${override ?? '(none)'}\n` +
         `agent policy:   ${policyText}${actual}\n\n` +
         `  :model <id>    override for this session\n` +
-        `  :model auto    clear the override, use the agent policy`,
+        `  :model auto    clear the override, use the agent policy\n\n` +
+        `  no provider is set up — :setup connects one and lets you pick its models`,
     };
   }
 
@@ -173,6 +304,96 @@ async function cmdModel(session: OpOneSession, arg: string): Promise<CommandResu
 
   session.setModelOverride(arg);
   return { output: `model override: ${arg}` };
+}
+
+// ── :provider / :setup ────────────────────────────────────────────────────────
+
+/** A profile by exact name, else by a prefix that names only one. */
+function findProfile(name: string): ProviderProfile | undefined {
+  const all = providerStore.list();
+  const exact = all.find(p => p.name === name) ?? all.find(p => p.name.toLowerCase() === name.toLowerCase());
+  if (exact) return exact;
+  const byPrefix = all.filter(p => p.name.toLowerCase().startsWith(name.toLowerCase()));
+  return byPrefix.length === 1 ? byPrefix[0] : undefined;
+}
+
+async function cmdSetup(
+  session: OpOneSession,
+  prompt?: (q: string) => Promise<string>,
+  io?: CommandIO,
+): Promise<CommandResult> {
+  const sio = dialogue(prompt, io);
+  if (!sio) return { output: 'setup needs an interactive terminal — run  opone --setup' };
+
+  const outcome = await runSetup(sio);
+  if (outcome.status === 'saved') {
+    dropStaleOverride(session);
+    return { output: `now using ${outcome.profile.name} — :provider switches, :model changes the model` };
+  }
+  if (outcome.status === 'cancelled') {
+    return { output: `setup cancelled: ${outcome.reason} — nothing was changed` };
+  }
+  return { output: '' };
+}
+
+async function cmdProvider(
+  session: OpOneSession,
+  arg: string,
+  prompt?: (q: string) => Promise<string>,
+  io?: CommandIO,
+): Promise<CommandResult> {
+  const [sub, ...restParts] = arg.split(/\s+/).filter(Boolean);
+  const rest = restParts.join(' ');
+
+  if (sub === 'add' || sub === 'new') return cmdSetup(session, prompt, io);
+
+  if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+    if (!rest) return { output: 'usage: :provider remove <name>' };
+    const target = findProfile(rest);
+    if (!target) return { output: `no provider "${rest}" — :provider to list` };
+
+    providerStore.remove(target.name);
+    dropStaleOverride(session);
+    const now = providerStore.active();
+    return {
+      output:
+        `removed ${target.name} and its saved key\n` +
+        (now ? `now using ${now.name} — ${now.model}` : 'no provider is set up — :setup connects one'),
+    };
+  }
+
+  if (sub) {
+    const name = sub === 'use' ? rest : arg;
+    if (!name) return { output: 'usage: :provider use <name>' };
+    const target = findProfile(name);
+    if (!target) return { output: `no provider "${name}" — :provider to list, :provider add to connect one` };
+
+    providerStore.setActive(target.name);
+    dropStaleOverride(session);
+    return {
+      output: `now using ${target.name} — ${target.model} at ${target.baseUrl}\n  :model to pick a different model`,
+    };
+  }
+
+  const profiles = providerStore.list();
+  if (profiles.length === 0) {
+    return { output: 'no provider is set up yet.\n\n  :setup   connect one — base URL, API key, then pick a model' };
+  }
+
+  const active = providerStore.active();
+  const width = Math.max(...profiles.map(p => p.name.length));
+  const lines = profiles.map(
+    p =>
+      `  ${p.name === active?.name ? '*' : ' '} ${p.name.padEnd(width)}  ${p.model}  ·  ${p.baseUrl}` +
+      (p.apiKey ? '' : '  (no key)'),
+  );
+  return {
+    output:
+      `providers:\n${lines.join('\n')}\n\n` +
+      `  :provider <name>          switch\n` +
+      `  :provider add             connect another\n` +
+      `  :provider remove <name>   forget one, and its key`,
+  };
 }
 
 // ── :council ──────────────────────────────────────────────────────────────────
@@ -331,9 +552,11 @@ async function cmdStatus(session: OpOneSession): Promise<CommandResult> {
   const last = session.lastResult();
   const prefs = session.preferences();
 
+  const profile = session.activeProvider();
   const lines = [
     `agent        : ${agent.name} (${agent.id})`,
-    `model        : ${session.activeModelOverride() ?? `policy:${agent.modelPolicy.kind}`}`,
+    `provider     : ${profile ? `${profile.name} (${profile.baseUrl})` : '(none — :setup connects one)'}`,
+    `model        : ${session.effectiveModel() ?? `policy:${agent.modelPolicy.kind}`}`,
     `verification : ${last ? stateLabel(last.verification.state) : '(no turn yet)'}`,
     `mesh         : ${prefs.mesh.enabled ? 'on' : 'off'}`,
     `conversation : ${session.conversationId}`,

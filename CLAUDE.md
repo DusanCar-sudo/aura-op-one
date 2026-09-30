@@ -59,21 +59,35 @@ Keep every such path inside `engine.ts`.
 - Commits need verification **and** explicit user approval. There is no
   auto-commit path, and `confirm` defaults to refusing.
 - Anything bound for a store, a log, or the UI goes through `redactSecrets` /
-  `redactValue` first.
+  `redactValue` first. Keys saved in `providers.json` are registered as literal
+  secrets when the store loads or writes (`registerSecret`), so they are redacted
+  even where they match no vendor pattern. A new place that holds a key must do
+  the same.
+- `providers.json` is the only file holding a secret: mode `0600`, atomic write,
+  never displayed (not in `:provider`, `:status`, errors, or the setup transcript;
+  the key prompt is not echoed). Never put a key in a URL or a log line.
+- Provider profiles are OpenAI-compatible endpoints (`baseUrl` + `apiKey` +
+  `model`). The model is chosen from the endpoint's own `GET {baseUrl}/models`
+  list (`providers.ts`), never typed from memory. `engine.ts` reads the active
+  profile on every run, so `:provider` / `:model` take effect on the next turn;
+  a **local** run (`local: true`) must bypass the profile.
 
 ## Storage
 
 Six **separate** categories under `~/.aura/op-one/`: conversations, preferences,
 agents, knowledge, episodes — plus in-memory scratch. Do not merge them into one
 store; the separation is what makes an agent's memory scope enforceable.
+`providers.json` sits beside them and is not memory.
 
 Override the root with `AURA_OP_ONE_DIR`. **Always set it in tests** so nothing
 touches the user's real data.
 
 ## The default screen
 
-Conversation, active agent, active model, verification state, and `:help`.
-Nothing else. No graphs, dashboards, telemetry, or routing internals — that
+Conversation, active agent, active provider and model, verification state, and
+`:help`. Nothing else. The first-run welcome (`setup.ts`) runs only on a real
+terminal, only until a provider exists or it is skipped once — a piped session
+must never have its script eaten by a dialogue. No graphs, dashboards, telemetry, or routing internals — that
 surface belongs to aura-pulse.
 
 ## Build, run, test
@@ -81,9 +95,10 @@ surface belongs to aura-pulse.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run — 172 tests, no provider needed
+npm test               # vitest run — 281 tests, no provider or real key needed
 node dist/cli.js --help
-AURA_OP_ONE_DIR=/tmp/x node dist/cli.js    # isolate its stores
+AURA_OP_ONE_DIR=/tmp/x node dist/cli.js    # isolate its stores (and first-run state)
+AURA_OP_ONE_DIR=/tmp/x node dist/cli.js --setup   # the provider dialogue
 ```
 
 ## Deferred on purpose (architecture §13)

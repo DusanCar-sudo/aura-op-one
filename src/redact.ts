@@ -3,11 +3,31 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Everything that leaves the process toward a log, a store, or the UI passes
-// through here (architecture §8). Aura OP One stores no credentials of its own —
-// they are read through aura-code's resolution — but it does handle text that
-// may quote them, so redaction is applied on the way out, not on the way in.
+// through here (architecture §8). The one credential OP One holds itself is the
+// API key of a provider profile (./stores.ts `providerStore`); that key is
+// registered here so it is scrubbed *literally*, whatever shape it has — vendor
+// patterns cannot be relied on for keys from arbitrary OpenAI-compatible
+// endpoints. Redaction is applied on the way out, not on the way in.
 
 const REDACTED = '[redacted]';
+
+/**
+ * Exact secret values registered at runtime. Below this length a literal match
+ * would start eating ordinary words, so shorter values are not registered.
+ */
+const MIN_LITERAL_SECRET_LENGTH = 8;
+const literalSecrets = new Set<string>();
+
+/** Registers a value (e.g. a provider API key) to be redacted wherever it appears. */
+export function registerSecret(value: string | undefined): void {
+  const v = (value ?? '').trim();
+  if (v.length >= MIN_LITERAL_SECRET_LENGTH) literalSecrets.add(v);
+}
+
+/** Forgets every registered secret. For tests, and when a key is deleted. */
+export function clearRegisteredSecrets(): void {
+  literalSecrets.clear();
+}
 
 /**
  * Patterns for values that must never be persisted or displayed.
@@ -39,6 +59,13 @@ const PATTERNS: Array<{ re: RegExp; replace: (m: string, ...g: string[]) => stri
 export function redactSecrets(text: string): string {
   if (!text) return text;
   let out = text;
+  // Literal values first, longest first, so a key that contains another
+  // registered key is removed whole rather than leaving a fragment behind.
+  if (literalSecrets.size > 0) {
+    for (const secret of [...literalSecrets].sort((a, b) => b.length - a.length)) {
+      if (out.includes(secret)) out = out.split(secret).join(REDACTED);
+    }
+  }
   for (const { re, replace } of PATTERNS) {
     out = out.replace(re, replace as (substring: string, ...args: unknown[]) => string);
   }

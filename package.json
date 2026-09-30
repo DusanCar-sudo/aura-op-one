@@ -1,6 +1,6 @@
 {
   "name": "aura-op-one",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Aura OP One — the minimal personal and agentic client for the Aura ecosystem. A quiet conversation with memory, a chosen agent, and a verification state you can trust.",
   "bin": {
     "opone": "dist/cli.js"

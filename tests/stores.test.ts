@@ -8,9 +8,11 @@ import {
   preferencesStore,
   knowledgeStore,
   opOneEpisodeStore,
+  providerStore,
   opOneRoot,
 } from '../src/stores.js';
 import { defaultAgent } from '../src/agent-schema.js';
+import { redactSecrets, clearRegisteredSecrets } from '../src/redact.js';
 import type { OpOneEpisode, Provenance } from '../src/types.js';
 
 let tmp: string;
@@ -188,5 +190,106 @@ describe('episode store', () => {
     opOneEpisodeStore.save(episode({ id: 'old', at: '2026-01-01T00:00:00.000Z' }));
     opOneEpisodeStore.save(episode({ id: 'new', at: '2026-06-01T00:00:00.000Z' }));
     expect(opOneEpisodeStore.list().map(e => e.id)).toEqual(['new', 'old']);
+  });
+});
+
+describe('provider store', () => {
+  const profile = (over: Partial<import('../src/types.js').ProviderProfile> = {}) => ({
+    name: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'sk-test-key-abcdef123456',
+    model: 'gpt-4o',
+    createdAt: '2026-09-30T00:00:00.000Z',
+    ...over,
+  });
+
+  it('starts empty: no active provider and the welcome not skipped', () => {
+    expect(providerStore.list()).toEqual([]);
+    expect(providerStore.active()).toBeUndefined();
+    expect(providerStore.welcomeSkipped()).toBe(false);
+  });
+
+  it('saves a profile, activates it, and reads it back from disk', () => {
+    providerStore.upsert(profile());
+    expect(providerStore.active()).toMatchObject({ name: 'openai', model: 'gpt-4o' });
+    expect(fs.existsSync(path.join(tmp, 'providers.json'))).toBe(true);
+  });
+
+  it('keeps the key file readable by its owner only', () => {
+    providerStore.upsert(profile());
+    const mode = fs.statSync(providerStore.filePath()).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it('leaves no temp file behind after a write', () => {
+    providerStore.upsert(profile());
+    expect(fs.readdirSync(tmp).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('replaces a profile of the same name instead of duplicating it', () => {
+    providerStore.upsert(profile());
+    providerStore.upsert(profile({ model: 'gpt-4o-mini' }));
+    expect(providerStore.list()).toHaveLength(1);
+    expect(providerStore.get('openai')?.model).toBe('gpt-4o-mini');
+  });
+
+  it('switches the active provider and changes a profile\'s model', () => {
+    providerStore.upsert(profile());
+    providerStore.upsert(profile({ name: 'local', baseUrl: 'http://localhost:11434/v1', apiKey: '', model: 'llama3' }));
+    expect(providerStore.active()?.name).toBe('local');
+
+    expect(providerStore.setActive('openai')?.name).toBe('openai');
+    expect(providerStore.active()?.name).toBe('openai');
+    expect(providerStore.setActive('nope')).toBeUndefined();
+
+    expect(providerStore.setModel('openai', ' gpt-4.1 ')?.model).toBe('gpt-4.1');
+    expect(providerStore.setModel('openai', '   ')).toBeUndefined();
+  });
+
+  it('finds the profile for an endpoint so setup can update rather than add', () => {
+    providerStore.upsert(profile());
+    expect(providerStore.findByUrl('https://api.openai.com/v1')?.name).toBe('openai');
+    expect(providerStore.findByUrl('https://elsewhere.example/v1')).toBeUndefined();
+  });
+
+  it('removing the active profile hands over to the next one, and removing the last leaves none', () => {
+    providerStore.upsert(profile());
+    providerStore.upsert(profile({ name: 'local', baseUrl: 'http://localhost:11434/v1', apiKey: '', model: 'llama3' }));
+    expect(providerStore.remove('local')).toBe(true);
+    expect(providerStore.active()?.name).toBe('openai');
+    expect(providerStore.remove('openai')).toBe(true);
+    expect(providerStore.active()).toBeUndefined();
+    expect(providerStore.remove('openai')).toBe(false);
+  });
+
+  it('refuses a profile with no model', () => {
+    expect(() => providerStore.upsert(profile({ model: '' }))).toThrow(/needs a name, a base URL and a model/);
+  });
+
+  it('drops malformed entries from a hand-edited file instead of crashing', () => {
+    fs.writeFileSync(
+      providerStore.filePath(),
+      JSON.stringify({ active: 'ok', profiles: [{ name: 'ok', baseUrl: 'http://x/v1', model: 'm', apiKey: '' }, { name: 5 }, 'junk', null] }),
+    );
+    expect(providerStore.list().map(p => p.name)).toEqual(['ok']);
+    expect(providerStore.active()?.name).toBe('ok');
+  });
+
+  it('survives a corrupt file', () => {
+    fs.writeFileSync(providerStore.filePath(), '{not json');
+    expect(providerStore.list()).toEqual([]);
+  });
+
+  it('remembers a skipped welcome across a later save', () => {
+    providerStore.skipWelcome();
+    providerStore.upsert(profile());
+    expect(providerStore.welcomeSkipped()).toBe(true);
+  });
+
+  it('registers stored keys so they are redacted everywhere afterwards', () => {
+    providerStore.upsert(profile({ apiKey: 'plain-not-pattern-shaped-key-77' }));
+    clearRegisteredSecrets();
+    providerStore.load();
+    expect(redactSecrets('the key is plain-not-pattern-shaped-key-77 ok')).not.toContain('plain-not-pattern-shaped-key-77');
   });
 });

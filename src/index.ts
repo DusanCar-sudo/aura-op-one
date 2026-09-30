@@ -24,6 +24,7 @@ export type {
   MeshRoutingRule,
   OpOneEpisode,
   ExecutionMode,
+  ProviderProfile,
 } from './types.js';
 
 // The aura-code boundary — the only seam.
@@ -59,6 +60,7 @@ export {
   preferencesStore,
   knowledgeStore,
   opOneEpisodeStore,
+  providerStore,
   opOneRoot,
 } from './stores.js';
 export type { KnowledgeItem } from './stores.js';
@@ -91,8 +93,21 @@ export { decideMesh, runOnMesh, matchesRule, createNullTransport } from './mesh.
 export type { MeshTransport, MeshTask, MeshResult, MeshDecision, MeshRunOutcome } from './mesh.js';
 
 export { runCommand, isCommand, formatTurn } from './commands.js';
-export type { CommandResult } from './commands.js';
+export type { CommandResult, CommandIO } from './commands.js';
 
-export { redactSecrets, redactValue } from './redact.js';
+export {
+  normalizeBaseUrl,
+  deriveProfileName,
+  buildModelsRequest,
+  parseModelIds,
+  fetchModels,
+  discoverModels,
+} from './providers.js';
+export type { UrlResult, ModelsResult, ModelsFailure } from './providers.js';
+
+export { runSetup, pickModel, matchModelChoice, renderModelList } from './setup.js';
+export type { SetupIO, SetupOptions, SetupOutcome, ModelChoice } from './setup.js';
+
+export { redactSecrets, redactValue, registerSecret, clearRegisteredSecrets } from './redact.js';
 export { renderStatusLine, renderAssistant, createSilentDisplay, HELP_TEXT } from './display.js';
 export type { StatusLine } from './display.js';

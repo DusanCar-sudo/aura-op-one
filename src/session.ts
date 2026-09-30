@@ -13,6 +13,7 @@ import type {
   AgentDefinition,
   OpOneEpisode,
   Preferences,
+  ProviderProfile,
   VerificationRecord,
   ExecutionMode,
   Provenance,
@@ -24,6 +25,7 @@ import {
   agentStore,
   conversationStore,
   preferencesStore,
+  providerStore,
   opOneEpisodeStore,
   newId,
 } from './stores.js';
@@ -116,6 +118,15 @@ export class OpOneSession {
 
   activeAgent(): AgentDefinition { return this.agent; }
   activeModelOverride(): string | undefined { return this.modelOverride; }
+  /** The saved provider profile the agent talks to, or undefined before setup. */
+  activeProvider(): ProviderProfile | undefined { return providerStore.active(); }
+  /**
+   * The model the next turn will use when the agent's policy does not pin one:
+   * a `:model` override, else the active profile's model. What the status line shows.
+   */
+  effectiveModel(): string | undefined {
+    return this.modelOverride ?? this.activeProvider()?.model;
+  }
   preferences(): Preferences { return this.prefs; }
   meshEnabled(): boolean { return this.prefs.mesh.enabled; }
   lastResult(): TurnResult | undefined { return this.lastTurn; }
@@ -170,7 +181,13 @@ export class OpOneSession {
     // 4. Act
     const tExec = Date.now();
     const filesBefore = this.engine.snapshotFiles(this.projectRoot);
-    const execution = await this.act(request, retrieved, resolved.model, opts.mesh ?? false);
+    const execution = await this.act(
+      request,
+      retrieved,
+      resolved.model,
+      resolved.isLocal,
+      opts.mesh ?? false,
+    );
     const executionMs = Date.now() - tExec;
     if (execution.fallback) fallback = execution.fallback;
 
@@ -253,6 +270,7 @@ export class OpOneSession {
     request: string,
     retrieved: ReturnType<typeof retrieve>,
     model: string,
+    isLocal: boolean,
     explicitMesh: boolean,
   ): Promise<{
     summary: string;
@@ -289,6 +307,7 @@ export class OpOneSession {
       projectRoot: this.projectRoot,
       task,
       model,
+      local: isLocal,
       instruction: this.agent.instruction,
       allowedTools: this.agent.permittedTools,
     });
@@ -470,6 +489,7 @@ export class OpOneSession {
       projectRoot: this.projectRoot,
       task: `Commit the current staged and unstaged changes with the message: ${message}`,
       model: last.model,
+      local: last.usedLocalModel,
       allowedTools: ['git', 'run_shell'],
       maxTurns: 4,
     });

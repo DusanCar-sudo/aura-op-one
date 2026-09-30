@@ -13,9 +13,11 @@ import { createLineReader } from './line-reader.js';
 import { OpOneSession } from './session.js';
 import { createAuraCodeEngine } from './engine.js';
 import { runCommand, isCommand, formatTurn } from './commands.js';
+import type { CommandIO } from './commands.js';
 import { renderStatusLine, renderAssistant, HELP_TEXT } from './display.js';
 import { PRODUCT_NAME } from './types.js';
-import { conversationStore } from './stores.js';
+import { conversationStore, providerStore } from './stores.js';
+import { runSetup } from './setup.js';
 
 export interface CliOptions {
   projectRoot?: string;
@@ -30,7 +32,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const opts = parseArgs(argv);
 
   if (opts.help) {
-    process.stdout.write(`${PRODUCT_NAME}\n\n${HELP_TEXT}\n`);
+    process.stdout.write(`${PRODUCT_NAME}\n\n${HELP_TEXT}\n\n${OPTIONS_TEXT}\n`);
     return 0;
   }
 
@@ -58,12 +60,45 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   process.stdout.write(`${PRODUCT_NAME} — :help for commands\n`);
   process.stdout.write(`ready in ${Date.now() - startedAt}ms\n\n`);
 
+  // What the dialogue commands (:setup, :model, :agent new) need beyond a prompt.
+  const io: CommandIO = {
+    askSecret: q => input.askSecret(q),
+    write: text => { process.stdout.write(text); },
+  };
+
   try {
+    // No provider yet: lead the person through connecting one. Only on a real
+    // terminal — a piped session must not have its script eaten by a dialogue —
+    // and only until they decline once. `--setup` runs it regardless.
+    const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (opts.setup || (!providerStore.active() && !providerStore.welcomeSkipped())) {
+      if (opts.setup || interactive) {
+        const outcome = await runSetup(
+          { ask: q => input.ask(q), askSecret: io.askSecret, write: io.write },
+          { welcome: !opts.setup },
+        );
+        if (outcome.status === 'saved' && session.activeModelOverride()) {
+          session.setModelOverride(undefined);
+        }
+        if (outcome.status === 'cancelled') {
+          process.stdout.write(`setup cancelled: ${outcome.reason} — type :setup to try again\n`);
+        }
+        process.stdout.write('\n');
+      } else {
+        process.stdout.write('no provider set up yet — type :setup to connect one\n\n');
+      }
+    }
+
     for (;;) {
+      const last = session.lastResult();
+      const ranLocal = Boolean(last?.usedLocalModel) && !session.activeModelOverride();
       const status = renderStatusLine({
         agentName: session.activeAgent().name,
-        model: session.activeModelOverride() ?? session.activeAgent().modelPolicy.kind,
-        isLocal: session.lastResult()?.usedLocalModel ?? false,
+        provider: session.activeProvider()?.name,
+        model: ranLocal
+          ? last!.model
+          : session.effectiveModel() ?? session.activeAgent().modelPolicy.kind,
+        isLocal: ranLocal,
         verification: session.lastResult()?.verification.state ?? 'unverified',
         meshEnabled: session.meshEnabled(),
       });
@@ -74,7 +109,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       if (!line) continue;
 
       if (isCommand(line)) {
-        const result = await runCommand(session, line, q => input.ask(q));
+        const result = await runCommand(session, line, q => input.ask(q), io);
         if (result.output) process.stdout.write(`${result.output}\n\n`);
         if (result.quit) return 0;
         continue;
@@ -97,13 +132,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
 interface ParsedArgs extends CliOptions {
   help?: boolean;
+  /** Run the provider dialogue at startup, even when one is already set up. */
+  setup?: boolean;
 }
+
+const OPTIONS_TEXT = `Options
+
+  --setup           connect a provider (or another one) before starting
+  --root <dir>      project root (default: the current directory)
+  --resume <id>     continue an earlier conversation
+  --test-command    command the verification gate runs
+  --readonly        the agent may read but not change anything
+  --auto            fewer confirmations`;
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') out.help = true;
+    else if (a === '--setup') out.setup = true;
     else if (a === '--root') out.projectRoot = argv[++i];
     else if (a === '--resume') out.conversationId = argv[++i];
     else if (a === '--test-command') out.testCommand = argv[++i];

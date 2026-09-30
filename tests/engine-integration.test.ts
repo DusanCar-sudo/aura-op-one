@@ -6,11 +6,32 @@
 // no provider, no network and no API key — permission enforcement, the file
 // snapshot, and evidence extraction — so a break in the actual wiring is caught.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
+import { spawnSync } from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
 import { createAuraCodeEngine, extractEvidence } from '../src/engine.js';
+import { providerStore } from '../src/stores.js';
+import type { ProviderProfile } from '../src/types.js';
+import { startMockProvider, MOCK_KEY, type MockProvider } from './mock-provider.js';
+
+// The default engine reads the active provider from the store, so nothing here
+// may see the real ~/.aura/op-one.
+let stateDir: string;
+let prevDir: string | undefined;
+
+beforeEach(() => {
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opone-engine-state-'));
+  prevDir = process.env.AURA_OP_ONE_DIR;
+  process.env.AURA_OP_ONE_DIR = stateDir;
+});
+
+afterEach(() => {
+  if (prevDir === undefined) delete process.env.AURA_OP_ONE_DIR;
+  else process.env.AURA_OP_ONE_DIR = prevDir;
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
 
 describe('real engine — permission enforcement', () => {
   it('enforces read-only through aura-code\'s permission system', () => {
@@ -149,5 +170,123 @@ describe('real engine — model resolution without a provider', () => {
       projectRoot: '/proj',
     });
     expect(resolved).toMatchObject({ model: 'my-cloud-model', isLocal: false });
+  });
+});
+
+describe('real engine — talks to the configured provider', () => {
+  let mock: MockProvider | undefined;
+  afterEach(async () => { await mock?.close(); mock = undefined; });
+
+  // A real repo, so aura-code's git calls stay quiet instead of printing "fatal: not a git repository".
+  const project = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opone-engine-proj-'));
+    spawnSync('git', ['init', '-q'], { cwd: dir });
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '--allow-empty', '-q', '-m', 'init'], { cwd: dir });
+    return dir;
+  };
+
+  function profileFor(m: MockProvider, over: Partial<ProviderProfile> = {}): ProviderProfile {
+    return { name: 'local', baseUrl: `${m.origin}/v1`, apiKey: MOCK_KEY, model: 'mock-mini', createdAt: new Date().toISOString(), ...over };
+  }
+
+  const chatCalls = (m: MockProvider) => m.requests.filter(r => r.method === 'POST' && r.url === '/v1/chat/completions');
+
+  it('sends the turn to the profile\'s base URL with its key and the chosen model', async () => {
+    mock = await startMockProvider();
+    const engine = createAuraCodeEngine({ activeProvider: () => profileFor(mock!) });
+    const root = project();
+
+    const result = await engine.run({ projectRoot: root, task: 'say hello', model: 'mock-large' });
+
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+    expect(result.summary).toContain('mock reply from mock-large');
+    const calls = chatCalls(mock);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[0].authorization).toBe(`Bearer ${MOCK_KEY}`);
+    expect((calls[0].body as { model: string }).model).toBe('mock-large');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads the active profile from the store on every run, so :provider and :model apply at once', async () => {
+    mock = await startMockProvider();
+    providerStore.upsert(profileFor(mock));
+    const engine = createAuraCodeEngine(); // default: providerStore.active()
+    const root = project();
+
+    await engine.run({ projectRoot: root, task: 'one', model: 'mock-mini' });
+    providerStore.setModel('local', 'mock-small');
+    const second = await engine.run({ projectRoot: root, task: 'two', model: 'default' });
+
+    const models = chatCalls(mock).map(c => (c.body as { model: string }).model);
+    expect(models[0]).toBe('mock-mini');
+    expect(models[models.length - 1]).toBe('mock-small'); // the 'default' placeholder became the profile's model
+    expect(second.summary).toContain('mock-small');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('maps the mesh fallback placeholder to the profile\'s model, not a literal "fallback"', async () => {
+    mock = await startMockProvider();
+    const engine = createAuraCodeEngine({ activeProvider: () => profileFor(mock!, { model: 'mock-large' }) });
+    const root = project();
+
+    await engine.run({ projectRoot: root, task: 'x', model: 'fallback' });
+
+    expect((chatCalls(mock)[0].body as { model: string }).model).toBe('mock-large');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a local run bypasses the remote profile entirely', async () => {
+    mock = await startMockProvider();
+    const engine = createAuraCodeEngine({ activeProvider: () => profileFor(mock!) });
+    const root = project();
+
+    // Goes to the local model server (or fails to reach it) — either way the remote
+    // profile must not receive it, or a "local" turn would leak to the cloud.
+    await engine.run({ projectRoot: root, task: 'private task', model: 'qwen2.5-coder:1.5b', local: true });
+
+    expect(chatCalls(mock)).toHaveLength(0);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a keyless profile still works (the SDK gets a placeholder, the server sees none it needs)', async () => {
+    mock = await startMockProvider({ key: null });
+    const engine = createAuraCodeEngine({ activeProvider: () => profileFor(mock!, { apiKey: '' }) });
+    const root = project();
+
+    const result = await engine.run({ projectRoot: root, task: 'hi', model: 'mock-mini' });
+
+    expect(result.success).toBe(true);
+    expect(result.summary).toContain('mock reply from mock-mini');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a rejected key is an error result that does not contain the key', async () => {
+    mock = await startMockProvider();
+    const engine = createAuraCodeEngine({ activeProvider: () => profileFor(mock!, { apiKey: 'sk-wrong-key-abcdef123456' }) });
+    const root = project();
+
+    const result = await engine.run({ projectRoot: root, task: 'hi', model: 'mock-mini' });
+
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain('sk-wrong-key-abcdef123456');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('resolves cloud-only to the profile\'s model when no cloud model is configured', async () => {
+    const engine = createAuraCodeEngine({
+      activeProvider: () => ({ name: 'p', baseUrl: 'http://x/v1', apiKey: '', model: 'profile-model', createdAt: '' }),
+    });
+    const resolved = await engine.resolveModel({ policy: { kind: 'cloud-only' }, task: 't', projectRoot: '/proj' });
+    expect(resolved).toMatchObject({ model: 'profile-model', isLocal: false });
+  });
+
+  it('an explicit cloudModel option still outranks the profile', async () => {
+    const engine = createAuraCodeEngine({
+      cloudModel: 'explicit',
+      activeProvider: () => ({ name: 'p', baseUrl: 'http://x/v1', apiKey: '', model: 'profile-model', createdAt: '' }),
+    });
+    const resolved = await engine.resolveModel({ policy: { kind: 'cloud-only' }, task: 't', projectRoot: '/proj' });
+    expect(resolved.model).toBe('explicit');
   });
 });

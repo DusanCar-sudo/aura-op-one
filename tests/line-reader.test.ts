@@ -93,3 +93,56 @@ describe('line reader', () => {
     expect(out.written.join('')).toBe('› :status\n');
   });
 });
+
+describe('line reader — secret input', () => {
+  it('does not echo a buffered (piped) secret into the transcript', async () => {
+    const rl = fakeRl();
+    const out = sink();
+    const reader = createLineReader(rl, out.stream);
+
+    rl.emit('line', 'sk-super-secret-value');
+    expect(await reader.askSecret('API key: ')).toBe('sk-super-secret-value');
+
+    const transcript = out.written.join('');
+    expect(transcript).toContain('API key: ********');
+    expect(transcript).not.toContain('sk-super-secret-value');
+  });
+
+  it('resolves a pending secret prompt when the line arrives', async () => {
+    const rl = fakeRl();
+    const out = sink();
+    const reader = createLineReader(rl, out.stream);
+
+    const pending = reader.askSecret('API key: ');
+    rl.emit('line', 'typed-secret-123');
+    expect(await pending).toBe('typed-secret-123');
+    expect(out.written.join('')).not.toContain('typed-secret-123');
+  });
+
+  it('returns empty once input has ended', async () => {
+    const rl = fakeRl();
+    const reader = createLineReader(rl, sink().stream);
+    rl.emit('close');
+    expect(await reader.askSecret('API key: ')).toBe('');
+  });
+
+  it('mutes readline\'s echo while a secret is typed on a terminal, and restores it after', async () => {
+    const rl = fakeRl() as unknown as EventEmitter & { _writeToOutput?: (s: string) => void };
+    const echoed: string[] = [];
+    const original = (s: string) => { echoed.push(s); };
+    rl._writeToOutput = original;
+    const out = sink();
+    (out.stream as unknown as { isTTY: boolean }).isTTY = true;
+    const reader = createLineReader(rl as unknown as Parameters<typeof createLineReader>[0], out.stream);
+
+    const pending = reader.askSecret('API key: ');
+    expect(rl._writeToOutput).not.toBe(original);
+    rl._writeToOutput!('s'); // a keystroke being echoed — must go nowhere
+    expect(echoed).toEqual([]);
+
+    rl.emit('line', 'typed');
+    expect(await pending).toBe('typed');
+    expect(rl._writeToOutput).toBe(original); // echo is back for the next prompt
+    expect(out.written.join('')).toContain('\n');
+  });
+});

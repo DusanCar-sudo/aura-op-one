@@ -188,9 +188,19 @@ content, always — regardless of recency or textual match score.
 
 ## 8. Permission and credential boundaries
 
-- Credentials are **read** through `aura-code`'s existing resolution
-  (`getApiKeyForModel`, env vars, global config). Aura OP One stores no secrets and
-  adds no second keychain.
+- Credentials for the built-in vendors are **read** through `aura-code`'s existing
+  resolution (`getApiKeyForModel`, env vars, global config).
+- The one secret Aura OP One stores is the API key a person gives the first-run
+  setup or `:setup`, kept in `~/.aura/op-one/providers.json` (mode `0600`, written
+  atomically) beside the endpoint's base URL and chosen model. It is never
+  displayed or logged, is registered with the redactor so it is scrubbed even in a
+  format `redactSecrets` does not recognise, and is deleted with the profile. It is
+  not memory and is never retrieved into a prompt. There is no second keychain:
+  the file is the owner's, protected by the OS user boundary.
+- A profile is an OpenAI-compatible endpoint. The model is chosen from the
+  endpoint's own model list (`GET {baseUrl}/models`), and the engine builds the
+  provider from the active profile on every run, so switching provider or model
+  needs no restart. Local-model runs bypass the profile.
 - Every value leaving the process toward a log, a store, or the UI passes
   `redactSecrets()`. API keys, bearer tokens, and `*_API_KEY`-shaped values are
   replaced with `[redacted]`.

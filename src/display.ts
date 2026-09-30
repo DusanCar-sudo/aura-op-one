@@ -52,6 +52,8 @@ export function createSilentDisplay(): Record<string, (...args: never[]) => void
 /** What the client is allowed to render on the default screen. */
 export interface StatusLine {
   agentName: string;
+  /** The connected provider's name, when one is set up. */
+  provider?: string;
   model: string;
   isLocal: boolean;
   verification: VerificationState;
@@ -80,7 +82,7 @@ export function renderStatusLine(s: StatusLine, useColor = true): string {
   const c = (code: string, text: string) => (useColor ? `${code}${text}${RESET}` : text);
   const parts = [
     c(BOLD, s.agentName),
-    `${s.model}${s.isLocal ? ' (local)' : ''}`,
+    `${s.provider && !s.isLocal ? `[${s.provider}] ` : ''}${s.model}${s.isLocal ? ' (local)' : ''}`,
     c(color(s.verification), stateLabel(s.verification)),
   ];
   if (s.meshEnabled) parts.push('mesh:on');
@@ -96,7 +98,9 @@ export const HELP_TEXT = `Aura OP One — commands
 
   :agent            list agents, or  :agent <id>  to switch
   :agent new        create an agent interactively
-  :model            show the active model, or  :model <id>  to override
+  :setup            connect a provider — base URL, API key, then pick a model
+  :provider         list providers, or  :provider <name>  to switch
+  :model            list the provider's models to pick from, or  :model <number|name>
   :council          ask one question of an explicitly chosen panel
   :mesh             show mesh state;  :mesh on|off  to toggle (off by default)
   :verify           verify the last output

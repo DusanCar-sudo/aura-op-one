@@ -11,7 +11,8 @@
 // place that imports from ../agent/, ../verify/, ../archimedes/, ../safety/ and
 // ../providers/. Tests substitute a fake engine.
 
-import type { VerificationEvidence } from './types.js';
+import type { ProviderProfile, VerificationEvidence } from './types.js';
+import { providerStore } from './stores.js';
 
 // Static, unlike every other aura-code import in this file.
 //
@@ -35,6 +36,11 @@ export interface EngineRunRequest {
   task: string;
   /** Resolved model id. */
   model: string;
+  /**
+   * True when `model` is the local (Archimedes) model. The active provider profile
+   * points at a remote endpoint, so a local run must bypass it and go to Ollama.
+   */
+  local?: boolean;
   /** Agent instruction, used as the system prompt override. */
   instruction?: string;
   /** Tool allow-list. Enforced by the loop in addition to permissions. */
@@ -185,7 +191,22 @@ export interface AuraCodeEngineOptions {
   cloudModel?: string;
   /** Local model tag; defaults to aura-code's Archimedes default. */
   localModel?: string;
+  /**
+   * The provider profile to use. Read on every call — never cached — so a
+   * `:provider` or `:model` change takes effect on the very next turn. Defaults
+   * to the saved active profile; tests inject their own.
+   */
+  activeProvider?: () => ProviderProfile | undefined;
 }
+
+/**
+ * Model names the client itself passes when it has no opinion — the mesh
+ * fallback and `:council`. With a profile active they mean "the profile's model".
+ */
+const PLACEHOLDER_MODELS = new Set(['default', 'fallback']);
+
+/** Endpoints that need no key still need a non-empty one for the OpenAI SDK. */
+const KEYLESS_PLACEHOLDER = 'none';
 
 /**
  * Wires the `Engine` interface onto aura-code. Imports are dynamic so that the
@@ -199,6 +220,8 @@ export function createAuraCodeEngine(opts: AuraCodeEngineOptions = {}): Engine {
   // permission check fails closed and spuriously denies legitimate work.
   const permissions = new PermissionSystem(permissionLevel);
 
+  const activeProvider = opts.activeProvider ?? (() => providerStore.active());
+
   return {
     async run(req: EngineRunRequest): Promise<EngineRunResult> {
       const { runAgentLoop } = await import('aura-code/dist/agent/loop.js');
@@ -208,7 +231,34 @@ export function createAuraCodeEngine(opts: AuraCodeEngineOptions = {}): Engine {
       const { createSilentDisplay } = await import('./display.js');
 
       const context = await loadProjectContext(req.projectRoot);
-      const provider = createProvider({ model: req.model });
+
+      // With a profile active, the base URL, key and model the person chose are
+      // used as given — createProvider's routing by model-name prefix would send
+      // `claude-*` to Anthropic's own SDK and demand an env var instead. The one
+      // exception is the local model, which must reach Ollama, not the profile.
+      const profile = req.local ? undefined : activeProvider();
+      let provider;
+      try {
+        if (profile) {
+          const { OpenAICompatibleProvider } = await import('aura-code/dist/providers/openai-compatible.js');
+          const model = PLACEHOLDER_MODELS.has(req.model) ? profile.model : req.model;
+          provider = new OpenAICompatibleProvider(
+            { model, baseUrl: profile.baseUrl, apiKey: profile.apiKey || KEYLESS_PLACEHOLDER },
+            profile.name,
+          );
+        } else {
+          provider = createProvider({ model: req.model });
+        }
+      } catch (e) {
+        return {
+          success: false,
+          summary: '',
+          turns: 0,
+          toolCalls: [],
+          tokens: { input: 0, output: 0 },
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
 
       try {
         const result = await runAgentLoop({
@@ -301,7 +351,10 @@ export function createAuraCodeEngine(opts: AuraCodeEngineOptions = {}): Engine {
     },
 
     async resolveModel(req: ResolveModelRequest): Promise<ResolvedModel> {
-      const cloud = opts.cloudModel ?? process.env.AURA_MODEL ?? 'claude-sonnet-4-5';
+      // The profile's model is "the cloud model" once a provider is set up; the
+      // env var and hard-coded default only serve installs that never ran setup.
+      const profile = activeProvider();
+      const cloud = opts.cloudModel ?? profile?.model ?? process.env.AURA_MODEL ?? 'claude-sonnet-4-5';
 
       // A session-level `:model` override wins over the agent's policy.
       if (req.override) {

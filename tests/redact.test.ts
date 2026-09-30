@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { redactSecrets, redactValue } from '../src/redact.js';
+import { redactSecrets, redactValue, registerSecret, clearRegisteredSecrets } from '../src/redact.js';
 import { conversationStore, opOneEpisodeStore } from '../src/stores.js';
 import { OpOneSession } from '../src/session.js';
 import { createFakeEngine } from './fake-engine.js';
@@ -131,5 +131,42 @@ describe('secrets never reach the stores or the UI', () => {
 
     expect(turn.reply).not.toContain('sk-ant-abcdefgh12345678');
     expect(turn.reply).toContain('[redacted]');
+  });
+});
+
+describe('registered literal secrets', () => {
+  afterEach(() => clearRegisteredSecrets());
+
+  it('redacts a key that matches no known vendor pattern once it is registered', () => {
+    const key = 'plain-hex-looking-key-9f8e7d6c5b4a';
+    expect(redactSecrets(`token is ${key}`)).toContain(key); // unknown shape: patterns miss it
+    registerSecret(key);
+    const out = redactSecrets(`token is ${key} and again ${key}`);
+    expect(out).not.toContain(key);
+    expect(out).toBe('token is [redacted] and again [redacted]');
+  });
+
+  it('reaches nested values through redactValue', () => {
+    registerSecret('another-custom-endpoint-key-123');
+    const out = redactValue({ a: ['x another-custom-endpoint-key-123 y'], b: { c: 'another-custom-endpoint-key-123' } });
+    expect(JSON.stringify(out)).not.toContain('another-custom-endpoint-key-123');
+  });
+
+  it('ignores values too short to be a key, so ordinary words are never blanked', () => {
+    registerSecret('none');
+    registerSecret('abc');
+    expect(redactSecrets('none of abc matters')).toBe('none of abc matters');
+  });
+
+  it('prefers the longer secret when one contains another', () => {
+    registerSecret('shared-prefix-key-AAAA');
+    registerSecret('shared-prefix-key-AAAA-extended');
+    expect(redactSecrets('v=shared-prefix-key-AAAA-extended')).toBe('v=[redacted]');
+  });
+
+  it('clearRegisteredSecrets forgets them', () => {
+    registerSecret('temporary-registered-key-1');
+    clearRegisteredSecrets();
+    expect(redactSecrets('temporary-registered-key-1')).toBe('temporary-registered-key-1');
   });
 });

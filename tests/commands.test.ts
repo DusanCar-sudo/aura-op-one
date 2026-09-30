@@ -4,10 +4,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { runCommand, isCommand, formatTurn } from '../src/commands.js';
 import { OpOneSession } from '../src/session.js';
-import { agentStore, knowledgeStore, preferencesStore } from '../src/stores.js';
+import { agentStore, knowledgeStore, preferencesStore, providerStore } from '../src/stores.js';
 import { defaultAgent } from '../src/agent-schema.js';
 import { renderStatusLine } from '../src/display.js';
 import { createFakeEngine } from './fake-engine.js';
+import { startMockProvider, scriptedIO, MOCK_KEY, type MockProvider } from './mock-provider.js';
+import { clearRegisteredSecrets } from '../src/redact.js';
 
 let tmp: string;
 let prevDir: string | undefined;
@@ -21,6 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearRegisteredSecrets();
   if (prevDir === undefined) delete process.env.AURA_OP_ONE_DIR;
   else process.env.AURA_OP_ONE_DIR = prevDir;
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -282,5 +285,251 @@ describe('default screen rendering', () => {
     expect(out).toContain('— rejected');
     expect(out).toContain('mesh:x → local-agent');
     expect(out).toContain('denied: run_shell');
+  });
+});
+
+describe('provider commands', () => {
+  let mock: MockProvider | undefined;
+  afterEach(async () => { await mock?.close(); mock = undefined; });
+
+  /** Connects the session's store to the mock endpoint, as :setup would have. */
+  async function connect(model = 'mock-mini', name = 'local'): Promise<MockProvider> {
+    mock = await startMockProvider();
+    providerStore.upsert({ name, baseUrl: `${mock.origin}/v1`, apiKey: MOCK_KEY, model, createdAt: new Date().toISOString() });
+    return mock;
+  }
+
+  it(':provider says how to get started when nothing is set up', async () => {
+    const out = (await runCommand(session, ':provider')).output;
+    expect(out).toMatch(/no provider is set up/);
+    expect(out).toContain(':setup');
+  });
+
+  it(':setup outside a terminal explains itself instead of hanging', async () => {
+    expect((await runCommand(session, ':setup')).output).toMatch(/interactive terminal/);
+  });
+
+  it(':setup runs the dialogue, saves the provider, and drops a stale :model override', async () => {
+    mock = await startMockProvider();
+    session.setModelOverride('stale-model-from-before');
+    const s = scriptedIO([`${mock.origin}/v1`, MOCK_KEY, '3']);
+
+    const out = (await runCommand(session, ':setup', q => s.io.ask(q), { askSecret: q => s.io.askSecret(q), write: t => s.io.write(t) })).output;
+
+    expect(out).toMatch(/now using local/);
+    expect(providerStore.active()).toMatchObject({ model: 'mock-small' });
+    expect(session.activeModelOverride()).toBeUndefined();
+    expect(session.effectiveModel()).toBe('mock-small');
+  });
+
+  it(':setup that is abandoned changes nothing and says so', async () => {
+    mock = await startMockProvider();
+    const s = scriptedIO([`${mock.origin}/v1`, 'sk-not-the-key-000000', '']);
+    const out = (await runCommand(session, ':setup', q => s.io.ask(q), { askSecret: q => s.io.askSecret(q), write: t => s.io.write(t) })).output;
+    expect(out).toMatch(/setup cancelled/);
+    expect(providerStore.list()).toEqual([]);
+  });
+
+  it(':provider lists profiles, marks the active one, and never shows a key', async () => {
+    await connect();
+    providerStore.upsert({ name: 'other', baseUrl: 'https://api.other.example/v1', apiKey: 'sk-other-key-abcdef123456', model: 'o-1', createdAt: '2026-01-01T00:00:00Z' }, { activate: false });
+
+    const out = (await runCommand(session, ':provider')).output;
+
+    expect(out).toMatch(/\* local/);
+    expect(out).toMatch(/ {3}other/);
+    expect(out).not.toContain(MOCK_KEY);
+    expect(out).not.toContain('sk-other-key-abcdef123456');
+  });
+
+  it(':provider <name> switches, by exact name or unique prefix, and drops a stale override', async () => {
+    await connect();
+    providerStore.upsert({ name: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'sk-or-key-abcdef1234567', model: 'x/y', createdAt: '2026-01-01T00:00:00Z' }, { activate: false });
+    session.setModelOverride('old');
+
+    const out = (await runCommand(session, ':provider open')).output;
+
+    expect(out).toMatch(/now using openrouter — x\/y/);
+    expect(providerStore.active()?.name).toBe('openrouter');
+    expect(session.activeModelOverride()).toBeUndefined();
+    expect((await runCommand(session, ':provider use local')).output).toMatch(/now using local/);
+  });
+
+  it(':provider <unknown> says so and points at the list', async () => {
+    await connect();
+    expect((await runCommand(session, ':provider nope')).output).toMatch(/no provider "nope"/);
+    expect(providerStore.active()?.name).toBe('local');
+  });
+
+  it(':provider remove forgets the profile and its key and reports what is in use now', async () => {
+    await connect();
+    providerStore.upsert({ name: 'second', baseUrl: 'https://api.second.example/v1', apiKey: 'sk-second-key-abcdef1234', model: 's-1', createdAt: '2026-01-01T00:00:00Z' }, { activate: false });
+
+    const out = (await runCommand(session, ':provider remove local')).output;
+
+    expect(out).toMatch(/removed local and its saved key/);
+    expect(out).toMatch(/now using second/);
+    expect(fs.readFileSync(providerStore.filePath(), 'utf8')).not.toContain(MOCK_KEY);
+  });
+
+  it(':provider remove of the last one says none is set up', async () => {
+    await connect();
+    expect((await runCommand(session, ':provider remove local')).output).toMatch(/no provider is set up/);
+  });
+
+  it(':status shows the provider, and the model comes from it', async () => {
+    await connect('mock-large');
+    const out = (await runCommand(session, ':status')).output;
+    expect(out).toMatch(/provider\s+: local \(http:\/\/127\.0\.0\.1:\d+\/v1\)/);
+    expect(out).toMatch(/model\s+: mock-large/);
+    expect(out).not.toContain(MOCK_KEY);
+  });
+
+  it(':status before setup points at :setup', async () => {
+    expect((await runCommand(session, ':status')).output).toMatch(/provider\s+: \(none — :setup connects one\)/);
+  });
+});
+
+describe(':model with a provider connected', () => {
+  let mock: MockProvider | undefined;
+  afterEach(async () => { await mock?.close(); mock = undefined; });
+
+  async function connect(model = 'mock-mini'): Promise<MockProvider> {
+    mock = await startMockProvider();
+    providerStore.upsert({ name: 'local', baseUrl: `${mock.origin}/v1`, apiKey: MOCK_KEY, model, createdAt: new Date().toISOString() });
+    return mock;
+  }
+
+  it('lists what the provider offers, marking the current model', async () => {
+    await connect('mock-mini');
+    const out = (await runCommand(session, ':model')).output;
+    expect(out).toMatch(/provider: {5}local/);
+    expect(out).toMatch(/model: {8}mock-mini/);
+    expect(out).toMatch(/1 {2}mock-large/);
+    expect(out).toMatch(/\* 2 {2}mock-mini/);
+    expect(out).toMatch(/3 {2}mock-small/);
+  });
+
+  it('switches by number against the list the provider reported', async () => {
+    await connect('mock-mini');
+    const out = (await runCommand(session, ':model 3')).output;
+    expect(out).toMatch(/model: mock-small {2}\(local\)/);
+    expect(providerStore.active()?.model).toBe('mock-small');
+    expect(session.effectiveModel()).toBe('mock-small');
+  });
+
+  it('switches by exact name or unique fragment', async () => {
+    await connect();
+    await runCommand(session, ':model mock-large');
+    expect(providerStore.active()?.model).toBe('mock-large');
+    await runCommand(session, ':model small');
+    expect(providerStore.active()?.model).toBe('mock-small');
+  });
+
+  it('reports an ambiguous fragment instead of guessing', async () => {
+    await connect();
+    const out = (await runCommand(session, ':model mock')).output;
+    expect(out).toMatch(/matches 3 models/);
+    expect(providerStore.active()?.model).toBe('mock-mini'); // unchanged
+  });
+
+  it('refuses a name the provider does not list, and takes it with "="', async () => {
+    await connect();
+    expect((await runCommand(session, ':model gpt-99')).output).toMatch(/no model matches/);
+    expect(providerStore.active()?.model).toBe('mock-mini');
+
+    await runCommand(session, ':model =my-finetune');
+    expect(providerStore.active()?.model).toBe('my-finetune');
+  });
+
+  it('a number that is out of range is explained', async () => {
+    await connect();
+    expect((await runCommand(session, ':model 42')).output).toMatch(/no entry 42/);
+  });
+
+  it('drops a stale session override so the switch is not silently ignored', async () => {
+    await connect();
+    session.setModelOverride('stale');
+    await runCommand(session, ':model 1');
+    expect(session.activeModelOverride()).toBeUndefined();
+    expect(session.effectiveModel()).toBe('mock-large');
+  });
+
+  it(':model auto clears an override and says which model is in use', async () => {
+    await connect('mock-small');
+    session.setModelOverride('stale');
+    const out = (await runCommand(session, ':model auto')).output;
+    expect(out).toMatch(/using mock-small from local/);
+    expect(session.activeModelOverride()).toBeUndefined();
+  });
+
+  it('with a terminal, lets the person pick from the list', async () => {
+    await connect('mock-mini');
+    const s = scriptedIO(['1']);
+    const out = (await runCommand(session, ':model', q => s.io.ask(q), { askSecret: q => s.io.askSecret(q), write: t => s.io.write(t) })).output;
+    expect(out).toMatch(/model: mock-large/);
+    expect(providerStore.active()?.model).toBe('mock-large');
+    expect(s.text()).toMatch(/Enter keeps mock-mini/);
+  });
+
+  it('with a terminal, Enter keeps the current model', async () => {
+    await connect('mock-mini');
+    const s = scriptedIO(['']);
+    const out = (await runCommand(session, ':model', q => s.io.ask(q), { askSecret: q => s.io.askSecret(q), write: t => s.io.write(t) })).output;
+    expect(out).toMatch(/model unchanged: mock-mini/);
+  });
+
+  it('when the list is unreachable, says why and still lets a typed name through', async () => {
+    const m = await connect();
+    await m.close();
+    mock = undefined;
+
+    const shown = (await runCommand(session, ':model')).output;
+    expect(shown).toMatch(/could not reach/);
+
+    expect((await runCommand(session, ':model 2')).output).toMatch(/cannot resolve "2" without the model list/);
+    const typed = (await runCommand(session, ':model my-model')).output;
+    expect(typed).toMatch(/model: my-model/);
+    expect(typed).toMatch(/could not check local's list/);
+    expect(providerStore.active()?.model).toBe('my-model');
+  });
+
+  it('warns when the agent is pinned to a model, since the pin wins', async () => {
+    await connect();
+    session.setAgent({ ...defaultAgent(), name: 'Pinned', modelPolicy: { kind: 'pinned', model: 'gpt-4o' } });
+    const out = (await runCommand(session, ':model 1')).output;
+    expect(out).toMatch(/pinned to gpt-4o, which takes precedence/);
+  });
+
+  it('never prints the key', async () => {
+    await connect();
+    for (const cmd of [':model', ':model 1', ':provider', ':status']) {
+      expect((await runCommand(session, cmd)).output, cmd).not.toContain(MOCK_KEY);
+    }
+  });
+});
+
+describe(':model without a provider (unchanged behaviour)', () => {
+  it('still sets a free-text override, and points at :setup', async () => {
+    const shown = (await runCommand(session, ':model')).output;
+    expect(shown).toContain('model override: (none)');
+    expect(shown).toContain(':setup');
+    await runCommand(session, ':model gpt-4o');
+    expect(session.activeModelOverride()).toBe('gpt-4o');
+  });
+});
+
+describe('help text', () => {
+  it('lists the provider commands', async () => {
+    const out = (await runCommand(session, ':help')).output;
+    expect(out).toContain(':setup');
+    expect(out).toContain(':provider');
+  });
+
+  it('renders the provider in the status line, except while a local model answers', () => {
+    const base = { agentName: 'Default', model: 'gpt-4o', verification: 'unverified' as const, meshEnabled: false };
+    expect(renderStatusLine({ ...base, provider: 'openai', isLocal: false })).toContain('[openai] gpt-4o');
+    expect(renderStatusLine({ ...base, provider: 'openai', isLocal: true })).not.toContain('[openai]');
+    expect(renderStatusLine({ ...base, isLocal: false })).not.toMatch(/\[\w+\] gpt-4o/);
   });
 });
