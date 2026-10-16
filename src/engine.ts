@@ -22,7 +22,16 @@ import { providerStore } from './stores.js';
 // the boundary — permissions pulls in readline, checks pulls in fs/path — so
 // loading them eagerly costs nothing worth deferring. Everything expensive
 // (providers, the agent loop, the terminal display) stays dynamic below.
-import { PermissionSystem } from 'aura-code/dist/safety/permissions.js';
+import { PermissionSystem, setConfirmHandler } from 'aura-code/dist/safety/permissions.js';
+
+/**
+ * aura-code's confirm() otherwise opens a second readline on stdin and closes it,
+ * which pauses stdin and swallows the answer — approvals never went through.
+ * Route its prompts through the client's own line reader instead.
+ */
+export function installConfirmHandler(ask: (message: string) => Promise<boolean>): void {
+  setConfirmHandler(async (message: string) => ask(message));
+}
 import { collectProjectFiles } from 'aura-code/dist/verify/checks.js';
 
 // ─────────────────────────────────────────────────────────────────────────────

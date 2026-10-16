@@ -9,9 +9,10 @@
 // it holds no logic of its own beyond wiring and prompting.
 
 import * as readline from 'readline';
+import { createSpinner } from './spinner.js';
 import { createLineReader } from './line-reader.js';
 import { OpOneSession } from './session.js';
-import { createAuraCodeEngine } from './engine.js';
+import { createAuraCodeEngine, installConfirmHandler } from './engine.js';
 import { runCommand, isCommand, formatTurn } from './commands.js';
 import type { CommandIO } from './commands.js';
 import { renderStatusLine, renderAssistant, HELP_TEXT } from './display.js';
@@ -38,12 +39,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   const projectRoot = opts.projectRoot ?? process.cwd();
   const engine = createAuraCodeEngine({
-    permissionLevel: opts.permissionLevel ?? 'normal',
+    permissionLevel: opts.permissionLevel ?? 'auto',
     testCommand: opts.testCommand,
   });
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const input = createLineReader(rl);
+  const spinner = createSpinner();
+  installConfirmHandler(message => spinner.paused(async () => {
+    const answer = await input.ask(`\n⚠️  ${message} [y/N] `);
+    return /^y(es)?$/i.test(answer.trim());
+  }));
 
   const session = new OpOneSession({
     engine,
@@ -51,10 +57,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     conversationId: opts.conversationId,
     testCommand: opts.testCommand,
     // Consequential actions ask. A non-"y" answer is a no.
-    confirm: async (message: string) => {
+    confirm: (message: string) => spinner.paused(async () => {
       const answer = await input.ask(`\n${message}\n  [y/N] `);
       return /^y(es)?$/i.test(answer.trim());
-    },
+    }),
   });
 
   process.stdout.write(`${PRODUCT_NAME} — :help for commands\n`);
@@ -116,7 +122,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       }
 
       const t0 = Date.now();
-      const turn = await session.handle(line);
+      spinner.start('thinking');
+      let turn;
+      try { turn = await session.handle(line); } finally { spinner.stop(); }
       const firstResponseMs = Date.now() - t0;
 
       process.stdout.write(`\n${renderAssistant(formatTurn(turn))}\n`);
@@ -143,7 +151,8 @@ const OPTIONS_TEXT = `Options
   --resume <id>     continue an earlier conversation
   --test-command    command the verification gate runs
   --readonly        the agent may read but not change anything
-  --auto            fewer confirmations`;
+  --auto            no confirmations except dangerous commands, which stay blocked (default)
+  --ask             confirm risky actions (normal mode)`;
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = {};
@@ -156,6 +165,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     else if (a === '--test-command') out.testCommand = argv[++i];
     else if (a === '--readonly') out.permissionLevel = 'read-only';
     else if (a === '--auto') out.permissionLevel = 'auto';
+    else if (a === '--ask') out.permissionLevel = 'normal';
   }
   return out;
 }
